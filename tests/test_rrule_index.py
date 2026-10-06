@@ -80,3 +80,59 @@ def test_count_and_until_caps_match_enumeration():
     assert rrulex.occurrence_index(rule2, last) == len(members2) - 1
     assert rrulex.occurrence_index(
         rule2, last + dt.timedelta(days=2)) is None
+
+
+def test_occurrence_at_index_matches_enumeration_far_out():
+    # The arithmetic inverse must agree with dateutil thousands of members
+    # away from DTSTART, across DST zones.
+    for tzname in ZONES:
+        tz = ZoneInfo(tzname)
+        for i in (1, 137, 1000, 5200):
+            rule = rrulex.build_rrule(
+                dt.datetime(2024, 1, 1, 9, tzinfo=tz),
+                freq="WEEKLY", interval=1)
+            assert rrulex.occurrence_at_index(rule, i) == rrulex._to_utc(
+                rule[i])
+        rule = rrulex.build_rrule(
+            dt.datetime(2024, 1, 1, 9, tzinfo=tz),
+            freq="DAILY", interval=3)
+        for i in (0, 77, 4321):
+            assert rrulex.occurrence_at_index(rule, i) == rrulex._to_utc(
+                rule[i])
+    # COUNT bounds: the member at the cap does not exist.
+    rule = rrulex.build_rrule(
+        dt.datetime(2025, 3, 10, 9, tzinfo=ZoneInfo("UTC")),
+        freq="WEEKLY", count=10)
+    import pytest
+    with pytest.raises(IndexError):
+        rrulex.occurrence_at_index(rule, 10)
+
+
+def test_indices_between_matches_bounded_enumeration():
+    # Plain DAILY/WEEKLY cadences (tail rules never carry BYDAY); windows are
+    # placed far from DTSTART to exercise the arithmetic path.
+    for tzname in ZONES:
+        tz = ZoneInfo(tzname)
+        for freq, interval in (("DAILY", 1), ("DAILY", 3),
+                               ("WEEKLY", 1), ("WEEKLY", 2)):
+            rule = rrulex.build_rrule(
+                dt.datetime(2024, 1, 1, 9, tzinfo=tz),
+                freq=freq, interval=interval)
+            lo = dt.datetime(2026, 10, 5, tzinfo=dt.timezone.utc)
+            hi = lo + dt.timedelta(days=7)
+            idxs = rrulex.indices_between(rule, lo, hi)
+            want = [rrulex.occurrence_index(rule, rrulex._to_utc(d))
+                    for d in rule.between(lo, hi, inc=True)
+                    if rrulex._to_utc(d) < hi]
+            assert idxs == want, (tzname, freq, interval)
+            # half-open semantics
+            for i in idxs:
+                assert lo <= rrulex.occurrence_at_index(rule, i) < hi
+    # COUNT-truncated tail: indices stop at the last member.
+    rule = rrulex.build_rrule(
+        dt.datetime(2024, 1, 1, 9, tzinfo=dt.timezone.utc),
+        freq="WEEKLY", count=100)
+    last = rrulex._to_utc(rule[99])
+    lo = last - dt.timedelta(days=30)
+    hi = last + dt.timedelta(days=30)
+    assert rrulex.indices_between(rule, lo, hi)[-1] == 99

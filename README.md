@@ -72,11 +72,15 @@ python3 -m pytest -q
 
 - 支持 IANA `TZID`（含夏令时）、`FREQ=DAILY` / `FREQ=WEEKLY`、`INTERVAL`、`BYDAY`、`WKST`、`UNTIL`、`COUNT`、`EXDATE`。
 - 单次例外（带 `RECURRENCE-ID` 的 REQUEST）只改那一场；会议被移动时**保留原场次的 RECURRENCE-ID 身份**，只改变展示起止。
+  即使原场次与改期后时间相隔任意远（远超一年、跨到下一年），只要**展示时间**落在查询周，该场就会出现且只裁决一次；
+  原规则场次本身也命中查询周时同样不会重复。
 - 单次例外**优先于** `EXDATE`（可以在被挖空的槽位上重新创建一场）。
 - `RECURRENCE-ID` 不是规则成员时：命中已移动场次的新起点即按原场次绑定；否则**回拨到较早的一次有效场次**，回拨会跳过 `EXDATE` 空洞。
-- `RANGE=THISANDFUTURE`（REQUEST）：保留边界之前的场次，边界起按例外的新起点与相同节奏延续，尾部场次仍用各自原始 RECURRENCE-ID。
+- `RANGE=THISANDFUTURE`（REQUEST）：保留边界之前的场次，边界起按例外的新起点与相同节奏延续，尾部场次仍用各自原始 RECURRENCE-ID；
+  改期尾部无论距边界多远，展示时间命中窗口时按原身份返回。
 - `RANGE=THISANDFUTURE`（CANCEL）：取消边界及之后所有场次；边界之后若来一份更新的单场 REQUEST，可单独复活该场。
-- 无限 `RRULE`（无 `COUNT/UNTIL`）**从不预展开**：查询只在窗口内有界枚举，场次下标用算术计算。
+- 无限 `RRULE`（无 `COUNT/UNTIL`）**从不预展开**：查询只在窗口内有界枚举，原场次下标与"第 n 场时间"均用算术计算（O(1)），
+  远距离前移、后移都不会触发任何方向上的无限展开。
 - 乱序投递：先到的 `REPLY` / `CANCEL`（甚至单场 REQUEST 例外）若还没有对应的 REQUEST，会进入暂存区；等 REQUEST 补齐后在同一事务里补裁决。
 
 **错误**
@@ -339,6 +343,115 @@ REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；�
 }
 ```
 
+### 10) 跨年（超 400 天）单次改期不漏场
+
+无限周规则从 **2024-01-01** 起每周一 09:00 UTC；把 **2025-03-10** 那场一次性前移到
+**2026-10-07**（相隔约 576 天，早已超出任何方向上的展开填充窗）。原场次身份
+`2025-03-10T09:00:00+00:00` 保留，展示起止改为 2026 年的时间；查询 2026-W41 周必须
+返回这一场且只返回一次。
+
+```bash
+curl -s -X POST http://localhost:8000/messages \
+  -H 'Content-Type: text/calendar' \
+  --data-binary @- <<'ICS'
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Acme//Meetings//EN
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:cross-year@acme.example
+DTSTAMP:20231220T120000Z
+SEQUENCE:0
+DTSTART:20240101T090000Z
+DTEND:20240101T100000Z
+RRULE:FREQ=WEEKLY;BYDAY=MO
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:alice@example.com
+END:VEVENT
+END:VCALENDAR
+ICS
+```
+
+```bash
+curl -s -X POST http://localhost:8000/messages \
+  -H 'Content-Type: text/calendar' \
+  --data-binary @- <<'ICS'
+BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:cross-year@acme.example
+DTSTAMP:20250305T120000Z
+SEQUENCE:0
+RECURRENCE-ID:20250310T090000Z
+DTSTART:20261007T090000Z
+DTEND:20261007T100000Z
+SUMMARY:Rescheduled across years
+END:VEVENT
+END:VCALENDAR
+ICS
+```
+
+针对改期后场次的回复可以直接用**改期后的起点**作为 `RECURRENCE-ID`，服务绑定回原场次身份：
+
+```bash
+curl -s -X POST http://localhost:8000/messages \
+  -H 'Content-Type: text/calendar' \
+  --data-binary @- <<'ICS'
+BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REPLY
+BEGIN:VEVENT
+UID:cross-year@acme.example
+DTSTAMP:20250305T130000Z
+SEQUENCE:0
+RECURRENCE-ID:20261007T090000Z
+ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com
+END:VEVENT
+END:VCALENDAR
+ICS
+```
+
+查询 2026-10-05 那一周（也可以写 `week=2026-W41`）：
+
+```bash
+curl -s -G http://localhost:8000/agenda \
+  --data-urlencode attendee=alice@example.com \
+  --data-urlencode start=2026-10-05T00:00:00Z \
+  --data-urlencode end=2026-10-12T00:00:00Z
+```
+
+返回（10 月 5 日是未移动的常规周一槽位，待回复；10 月 7 日那场带着**原**
+RECURRENCE-ID `2025-03-10T13:00`… UTC 槽位的身份出现，显示为改期后的时间且已接受；
+两场各只出现一次）：
+
+```json
+{
+  "attendee": "alice@example.com",
+  "start": "2026-10-05T00:00:00+00:00",
+  "end": "2026-10-12T00:00:00+00:00",
+  "events": [
+    {
+      "uid": "cross-year@acme.example",
+      "recurrence_id": "2026-10-05T09:00:00+00:00",
+      "start": "2026-10-05T09:00:00+00:00",
+      "end": "2026-10-05T10:00:00+00:00",
+      "status": "needs-action"
+    },
+    {
+      "uid": "cross-year@acme.example",
+      "recurrence_id": "2025-03-10T09:00:00+00:00",
+      "start": "2026-10-07T09:00:00+00:00",
+      "end": "2026-10-07T10:00:00+00:00",
+      "status": "accepted"
+    }
+  ]
+}
+```
+
+后移（原场次在查询周之后，例如把 2027-04-19 移回 2026-10-08）同理：按原
+RECURRENCE-ID `2027-04-19T09:00:00+00:00` 在 2026 年的显示时间出现一次；若该场已被
+CANCEL，则以 `cancelled` 状态显示在改期后的时间上。
+
 ---
 
 ## 四、HTTP 接口摘要
@@ -361,9 +474,15 @@ REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；�
 
 ## 五、性能
 
-- 单次/周期主表使用部分索引（单次按时间、周期按首场、例外按移动后起点）。
-- 周期查询默认只在请求窗口内有界枚举；只有存在移动例外的序列才向前后各扩 400 天
-  的填充窗以定位移动场次。
+- 单次/周期主表使用部分索引（单次按时间、周期按首场、单场例外按移动后显示区间、
+  RANGE 例外按是否携带边界）。
+- 周期查询只在**请求窗口本身**内有界枚举，无限规则每窗至多枚举一周；不再有按天向
+  前后扩窗的填充。
+- 远距离改期靠两条算术路径定位，均为 O(1)、不展开规则：
+  显示时间命中窗口的单场例外直接按原 `RECURRENCE-ID` 算出原下标（顺带取得该下标处的
+  RANGE 状态）；`RANGE=THISANDFUTURE` 改期尾部只在窗口内按周期算术求候选下标，再映射
+  回原下标。每个原身份全程只裁决一次。
 - 场次下标为算术计算（O(1)），不从头枚举。
 - 基准测试 `tests/test_perf.py`：单个参会人 **100,000** 条历史通知（外加一条无限周规则），
-  周窗查询约 **15–35 ms**（远低于 1 秒预算）；周窗约 100 场时同样在数十毫秒内。
+  周窗查询约 **15–50 ms**（远低于 1 秒预算）；周窗约 100 场、或一条序列携带数百个远距离
+  RANGE 边界时同样在数十至数百毫秒内。

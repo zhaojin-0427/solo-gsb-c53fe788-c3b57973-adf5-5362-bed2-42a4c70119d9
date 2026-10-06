@@ -87,11 +87,14 @@ CREATE INDEX IF NOT EXISTS idx_vevents_singles
 -- Recurring masters whose first occurrence starts before the window end.
 CREATE INDEX IF NOT EXISTS idx_vevents_series_first
     ON vevents(is_master, start_utc, rrule_last) WHERE is_master = 1 AND rrule IS NOT NULL;
--- Overrides whose (possibly moved) start falls in a padded window.
+-- Overrides whose (possibly moved) display interval may intersect a query window.
 CREATE INDEX IF NOT EXISTS idx_vevents_override_start
-    ON vevents(is_master, start_utc) WHERE is_master = 0;
+    ON vevents(is_master, start_utc, end_utc) WHERE is_master = 0;
 CREATE INDEX IF NOT EXISTS idx_vevents_override_rid
     ON vevents(uid, rid) WHERE is_master = 0;
+-- Series carrying a RANGE=THISANDFUTURE boundary (tail may reach any window).
+CREATE INDEX IF NOT EXISTS idx_vevents_override_range
+    ON vevents(uid) WHERE is_master = 0 AND is_range = 1;
 CREATE INDEX IF NOT EXISTS idx_exdates ON exdates(uid);
 CREATE INDEX IF NOT EXISTS idx_cancelled ON cancelled_instances(uid, rid);
 CREATE INDEX IF NOT EXISTS idx_replies_lookup ON replies(email, uid, rid);

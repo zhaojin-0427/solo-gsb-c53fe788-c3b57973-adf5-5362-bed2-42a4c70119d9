@@ -1,7 +1,21 @@
 """Render an attendee's agenda over a half-open UTC window.
 
-Expansion is always bounded by the (padded) query window; infinite RRULEs are
-never pre-expanded.  Semantics:
+Expansion is always bounded by the query window itself; infinite RRULEs are
+never pre-expanded.  A recurring series contributes instances from up to
+three sources, each adjudicated exactly once under its *original*
+RECURRENCE-ID identity:
+
+A. master-rule slots that fall in the window (tight window enumeration; an
+   infinite rule enumerates at most the window length);
+B. single (non-RANGE) overrides whose *display* interval intersects the
+   window even when the original slot is arbitrarily far away (the moved
+   meeting keeps the identity of its original occurrence; the original index
+   is located arithmetically, O(1), never by enumeration);
+C. RANGE=THISANDFUTURE REQUEST tails whose continued cadence places members
+   in the window (the tail rule is enumerated inside the window only and
+   mapped back to original indices).
+
+Other semantics:
 
 * Per-instance single overrides replace only their occurrence; the original
   RECURRENCE-ID identity is preserved even when the meeting moves.
@@ -17,17 +31,13 @@ never pre-expanded.  Semantics:
 """
 from __future__ import annotations
 
+import bisect
 import datetime as dt
-import sqlite3
 from zoneinfo import ZoneInfo
 
 from dateutil import rrule as _rr
 
 from . import rrulex
-
-# Moved instances can land earlier than their original slot; pad the window
-# used for master expansion accordingly.
-WINDOW_PAD = dt.timedelta(days=400)
 
 
 def _iso(d: dt.datetime) -> str:
@@ -35,11 +45,10 @@ def _iso(d: dt.datetime) -> str:
 
 
 def agenda(conn, attendee: str, start: dt.datetime, end: dt.datetime) -> list[dict]:
-    uids, padded = _candidate_uids(conn, attendee, start, end)
+    uids = _candidate_uids(conn, attendee, start, end)
     results: list[dict] = []
     for uid in uids:
-        results.extend(_render_uid(conn, attendee, uid, start, end,
-                                   padded=uid in padded))
+        results.extend(_render_uid(conn, attendee, uid, start, end))
     results.sort(key=lambda e: (e["start"], e["uid"], e["recurrence_id"] or ""))
     return results
 
@@ -48,10 +57,15 @@ def agenda(conn, attendee: str, start: dt.datetime, end: dt.datetime) -> list[di
 # candidate UIDs (indexed prefilters; rrule work only for plausible series)
 # ---------------------------------------------------------------------------
 
-def _candidate_uids(conn, email, start, end) -> tuple[list[str], set[str]]:
-    """Return (candidate uids, uids that need padded recurrence expansion)."""
+def _candidate_uids(conn, email, start, end) -> list[str]:
+    """UIDs that may contribute anything to [start, end).
+
+    No distance padding is used: an override whose *display* interval
+    intersects the window always selects its series regardless of how far its
+    original slot is, and every series carrying a RANGE=THISANDFUTURE boundary
+    is selected (tail members may have moved arbitrarily far).
+    """
     uids: set[str] = set()
-    padded: set[str] = set()
 
     rows = conn.execute(
         """SELECT DISTINCT v.uid FROM vevents v
@@ -63,7 +77,7 @@ def _candidate_uids(conn, email, start, end) -> tuple[list[str], set[str]]:
     uids.update(r["uid"] for r in rows)
 
     # Recurring series with an occurrence directly in the window: tight,
-    # unpadded expansion (infinite rules enumerate at most a week).
+    # unpadded expansion (infinite rules enumerate at most the window).
     rows = conn.execute(
         """SELECT v.* FROM vevents v
            JOIN attendees a ON a.uid = v.uid
@@ -77,26 +91,34 @@ def _candidate_uids(conn, email, start, end) -> tuple[list[str], set[str]]:
         if rr.between(start, end, inc=True):
             uids.add(m["uid"])
 
-    # Series with a moved override whose display time lands near/in the window
-    # need padded expansion so the moved instance keeps its original identity.
+    # Single overrides whose (possibly moved) display interval intersects the
+    # window, no matter how far the original RECURRENCE-ID slot sits.
     rows = conn.execute(
         """SELECT DISTINCT v.uid FROM vevents v
            JOIN attendees a ON a.uid = v.uid
-           WHERE a.email = ? AND v.is_master=0
-             AND v.start_utc >= ? AND v.start_utc < ?""",
-        (email, _iso(start - WINDOW_PAD), _iso(end)),
+           WHERE a.email = ? AND v.is_master=0 AND v.is_range=0
+             AND v.start_utc < ? AND v.end_utc > ?""",
+        (email, _iso(end), _iso(start)),
     ).fetchall()
-    for r in rows:
-        uids.add(r["uid"])
-        padded.add(r["uid"])
-    return sorted(uids), padded
+    uids.update(r["uid"] for r in rows)
+
+    # Series carrying any RANGE=THISANDFUTURE boundary: the continued tail (or
+    # its cancellation) may reach the window from far away.
+    rows = conn.execute(
+        """SELECT DISTINCT v.uid FROM vevents v
+           JOIN attendees a ON a.uid = v.uid
+           WHERE a.email = ? AND v.is_master=0 AND v.is_range=1""",
+        (email,),
+    ).fetchall()
+    uids.update(r["uid"] for r in rows)
+    return sorted(uids)
 
 
 # ---------------------------------------------------------------------------
 # per-UID rendering
 # ---------------------------------------------------------------------------
 
-def _render_uid(conn, email, uid, win_start, win_end, padded=False) -> list[dict]:
+def _render_uid(conn, email, uid, win_start, win_end) -> list[dict]:
     master = conn.execute(
         "SELECT * FROM vevents WHERE uid=? AND is_master=1", (uid,)
     ).fetchone()
@@ -116,8 +138,8 @@ def _render_uid(conn, email, uid, win_start, win_end, padded=False) -> list[dict
         return [_render_single(master, overrides, cancels, replies)]
 
     return _render_recurring(
-        master, overrides, cancels, exdates, replies,
-        win_start, win_end, padded=padded)
+        master, overrides, cancels, exdates, replies, win_start, win_end)
+
 
 def _instance_status(key, overrides, cancels, replies, tail_cancel=None):
     ov = overrides.get(key)
@@ -170,48 +192,59 @@ def _render_single(master, overrides, cancels, replies):
 
 
 def _render_recurring(master, overrides, cancels, exdates, replies,
-                      win_start, win_end, padded=False):
+                      win_start, win_end):
     rr = rrulex.get_rrule(master["rrule"], master["start_utc"],
                           master["rrule_tzid"])
     master_duration = master["duration_s"]
 
-    if padded:
-        # A moved exception may sit outside its original slot on either side.
-        exp_start, exp_end = win_start - WINDOW_PAD, win_end + WINDOW_PAD
-    else:
-        exp_start, exp_end = win_start, win_end
-    base = rrulex.occurrences_between(rr, exp_start, exp_end)
-
-    # Sorted THISANDFUTURE boundary table: index -> effective state.
+    # Sorted THISANDFUTURE boundary table: master index -> effective state.
     boundaries = _boundary_table(rr, overrides, cancels)
+    bound_indices = sorted(boundaries)
 
-    # tail state: None = master cadence
-    #   ("cancel", cancel_row) -> occurrences from this index onward cancelled
-    #   ("shift", tail_rr, start_idx, duration_s)
-    tail = None
-    tail_cancel = None
-    out = []
-    for occ_utc in base:
+    def tail_state(idx):
+        """Boundary state effective at master index ``idx`` (None = head)."""
+        if idx is None:
+            return None
+        pos = bisect.bisect_right(bound_indices, idx)
+        return boundaries[bound_indices[pos - 1]] if pos else None
+
+    emitted: dict[str, dict] = {}
+
+    def emit(key, disp_start, disp_end, tail_cancel):
+        # Half-open intersection with the requested window; one adjudication
+        # per original RECURRENCE-ID, whichever source reaches it first.
+        if disp_start >= win_end or disp_end <= win_start or key in emitted:
+            return
+        emitted[key] = {
+            "uid": master["uid"],
+            "recurrence_id": key,
+            "start": _iso(disp_start),
+            "end": _iso(disp_end),
+            "status": _instance_status(
+                key, overrides, cancels, replies, tail_cancel),
+        }
+
+    # -- A) master-rule slots inside the tight window ---------------------
+    for occ_utc in rrulex.occurrences_between(rr, win_start, win_end):
         key = rrulex.to_utc_iso(occ_utc)
         idx = rrulex.occurrence_index(rr, occ_utc)
         if idx is None:
             continue
-        if idx in boundaries:
-            tail = boundaries[idx]
-            tail_cancel = tail[1] if tail[0] == "cancel" else None
+        state = tail_state(idx)
+        tail_cancel = state[1] if state is not None and state[0] == "cancel" \
+            else None
 
         single = overrides.get(key)
         if single is not None and not single["is_range"]:
             disp_start = rrulex.parse_utc(single["start_utc"])
             disp_end = rrulex.parse_utc(single["end_utc"])
-        elif tail is not None and tail[0] == "cancel":
+        elif state is not None and state[0] == "cancel":
             disp_start, disp_end = occ_utc, occ_utc + dt.timedelta(
                 seconds=master_duration)
-        elif tail is not None and tail[0] == "shift":
-            _, tail_rr, start_idx, duration_s = tail
-            n = idx - start_idx
+        elif state is not None and state[0] == "shift":
+            _, tail_rr, start_idx, duration_s = state
             try:
-                disp_start = rrulex.occurrence_at(tail_rr, n)
+                disp_start = rrulex.occurrence_at_index(tail_rr, idx - start_idx)
             except IndexError:
                 continue
             disp_end = disp_start + dt.timedelta(seconds=duration_s)
@@ -221,19 +254,58 @@ def _render_recurring(master, overrides, cancels, exdates, replies,
             disp_start = occ_utc
             disp_end = occ_utc + dt.timedelta(seconds=master_duration)
 
-        # Half-open intersection with the requested window.
-        if disp_start >= win_end or disp_end <= win_start:
-            continue
+        emit(key, disp_start, disp_end, tail_cancel)
 
-        out.append({
-            "uid": master["uid"],
-            "recurrence_id": key,
-            "start": _iso(disp_start),
-            "end": _iso(disp_end),
-            "status": _instance_status(
-                key, overrides, cancels, replies, tail_cancel),
-        })
-    return out
+    # -- B) far-moved single overrides whose display time hits the window --
+    # The original slot lies outside the tight window (otherwise pass A has
+    # already emitted this identity); its master index is found arithmetically
+    # so RANGE state at that index is still adjudicated correctly.
+    for ov in overrides.values():
+        if ov["is_range"]:
+            continue
+        key = ov["rid"]
+        disp_start = rrulex.parse_utc(ov["start_utc"])
+        disp_end = rrulex.parse_utc(ov["end_utc"])
+        if disp_start >= win_end or disp_end <= win_start or key in emitted:
+            continue
+        idx = rrulex.occurrence_index(rr, rrulex.parse_utc(key))
+        state = tail_state(idx)
+        tail_cancel = state[1] if state is not None and state[0] == "cancel" \
+            else None
+        emit(key, disp_start, disp_end, tail_cancel)
+
+    # -- C) RANGE=THISANDFUTURE shift tails reaching into the window -------
+    # Enumerate each tail rule *inside the window only* (bounded even for
+    # infinite rules) and map tail members back to their original indices.
+    for b_idx in bound_indices:
+        state = boundaries[b_idx]
+        if state[0] != "shift":
+            continue
+        _, tail_rr, start_idx, duration_s = state
+        for n in rrulex.indices_between(tail_rr, win_start, win_end):
+            idx = start_idx + n
+            active = tail_state(idx)
+            # A later boundary supersedes this tail (a newer shift owns the
+            # member, or a RANGE CANCEL removed it); only the live tail emits.
+            if active is None or active[0] != "shift" \
+                    or active[2] != start_idx:
+                continue
+            try:
+                orig = rrulex.occurrence_at_index(rr, idx)
+                t_occ = rrulex.occurrence_at_index(tail_rr, n)
+            except IndexError:
+                continue
+            key = rrulex.to_utc_iso(orig)
+            if key in emitted:
+                continue
+            # An explicit single override pins that member's display time;
+            # the tail cadence must not leak through (pass B owns it).
+            single = overrides.get(key)
+            if single is not None and not single["is_range"]:
+                continue
+            emit(key, t_occ, t_occ + dt.timedelta(seconds=duration_s), None)
+
+    return list(emitted.values())
 
 
 def _boundary_table(rr, overrides, cancels) -> dict:

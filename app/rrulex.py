@@ -204,6 +204,54 @@ def _weekly_byday_index(start, target, interval, weekdays) -> int | None:
     return first_week_count + (block - 1) * len(weekdays) + pos_in_week
 
 
+def occurrence_at_index(rr: _rr.rrule, index: int) -> _dt.datetime:
+    """UTC datetime of the ``index``-th (0-based) rule member, arithmetically.
+
+    Inverse of :func:`occurrence_index` for DAILY/WEEKLY: no enumeration, so
+    members arbitrarily far from DTSTART stay O(1).  COUNT/UNTIL bounds are
+    re-checked via ``occurrence_index`` (which returns None past the end).
+    """
+    if index < 0:
+        raise IndexError(index)
+    start: _dt.datetime = rr._dtstart
+    tz = start.tzinfo
+    naive = start.replace(tzinfo=None) if tz is not None else start.replace()
+
+    rule = getattr(rr, "_original_rule", {}) or {}
+    interval = rr._interval or 1
+    if rr._freq == _rr.DAILY:
+        cand_naive = naive + _dt.timedelta(days=index * interval)
+    else:
+        byday = rule.get("byweekday")
+        if byday is None:
+            cand_naive = naive + _dt.timedelta(weeks=index * interval)
+        else:
+            weekdays = sorted(d.weekday for d in byday)
+            first = [w for w in weekdays if w >= start.weekday()]
+            if index < len(first):
+                monday0 = naive.date() - _dt.timedelta(days=start.weekday())
+                d = monday0 + _dt.timedelta(days=first[index])
+            else:
+                k = index - len(first)
+                block, pos = 1 + k // len(weekdays), k % len(weekdays)
+                monday0 = naive.date() - _dt.timedelta(days=start.weekday())
+                d = monday0 + _dt.timedelta(
+                    weeks=block * interval, days=weekdays[pos])
+            cand_naive = _dt.datetime.combine(d, naive.timetz().replace(
+                tzinfo=None))
+
+    if tz is not None:
+        cand = cand_naive.replace(tzinfo=tz)
+    else:
+        cand = cand_naive
+    cand_utc = _to_utc(cand)
+    # Membership guard: rejects indices past COUNT/UNTIL and any arithmetic
+    # mismatch with dateutil's own generation.
+    if occurrence_index(rr, cand_utc) != index:
+        raise IndexError(index)
+    return cand_utc
+
+
 def occurrence_at(rr: _rr.rrule, index: int) -> _dt.datetime:
     return _to_utc(rr[index])
 
@@ -213,6 +261,56 @@ def last_occurrence(rr: _rr.rrule, count: int | None) -> _dt.datetime | None:
     if count is not None:
         return _to_utc(rr[-1])
     return None
+
+
+def indices_between(rr: _rr.rrule, start_utc: _dt.datetime,
+                    end_utc: _dt.datetime) -> list[int]:
+    """Indices n for which the n-th member lies in [start_utc, end_utc).
+
+    Arithmetic only, for the cadences this service builds (DAILY, or WEEKLY
+    without BYDAY -- in particular RANGE=THISANDFUTURE tail rules).  Returns at
+    most the window-length membership plus a one-period safety margin that
+    absorbs DST wall-clock shifts; COUNT/UNTIL are enforced by membership
+    checks.  Never iterates the rule, so it stays cheap for tails seeded
+    arbitrarily far from the window.
+    """
+    start = rr._dtstart
+    tz = start.tzinfo
+    if tz is not None:
+        start_local = start
+        lo = start_utc.astimezone(tz)
+        hi = end_utc.astimezone(tz)
+    else:
+        start_local = start.replace(tzinfo=None)
+        lo = start_utc.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        hi = end_utc.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+
+    rule = getattr(rr, "_original_rule", {}) or {}
+    interval = rr._interval or 1
+    if rule.get("byweekday"):
+        raise CalendarError(
+            "indices_between supports only plain DAILY/WEEKLY cadences")
+
+    period_days = interval if rr._freq == _rr.DAILY else interval * 7
+    period_s = period_days * 86400.0
+    n_lo = int((lo.replace(tzinfo=None) - start_local.replace(
+        tzinfo=None)).total_seconds() // period_s) - 1
+    n_hi = int((hi.replace(tzinfo=None) - start_local.replace(
+        tzinfo=None)).total_seconds() // period_s) + 1
+    n_lo = max(0, n_lo)
+    count = getattr(rr, "_count", None)
+    if count is not None:
+        n_hi = min(n_hi, count - 1)
+
+    out: list[int] = []
+    for n in range(n_lo, n_hi + 1):
+        try:
+            when = occurrence_at_index(rr, n)
+        except IndexError:
+            break
+        if start_utc <= when < end_utc:
+            out.append(n)
+    return out
 
 
 def earlier_valid_occurrence(

@@ -73,8 +73,9 @@ def rrule_to_json(rr: _rr.rrule) -> str:
     if wkst is not None:
         inv = {v.weekday: k for k, v in _WEEKDAYS.items()}
         payload["wkst"] = inv[wkst]
-    if rule.get("until") is not None:
-        payload["until"] = to_utc_iso(rule["until"])
+    until = getattr(rr, "_until", None)
+    if until is not None:
+        payload["until"] = to_utc_iso(until)
     count = getattr(rr, "_count", None)
     if count is not None:
         payload["count"] = count
@@ -116,8 +117,7 @@ def get_rrule(payload: str, start_utc: str, tzid: str) -> _rr.rrule:
 def occurrences_between(rr: _rr.rrule, start_utc: _dt.datetime,
                         end_utc: _dt.datetime) -> list[_dt.datetime]:
     """Occurrences with start in the half-open UTC window [start_utc, end_utc)."""
-    return [_to_utc(d) for d in rr.between(start_utc, end_utc, inc=True)
-            if _to_utc(d) < end_utc]
+    return [when for _idx, when in occurrence_schedule(rr, start_utc, end_utc)]
 
 
 def occurrence_index(rr: _rr.rrule, occ_utc: _dt.datetime) -> int | None:
@@ -160,15 +160,8 @@ def occurrence_index(rr: _rr.rrule, occ_utc: _dt.datetime) -> int | None:
             if idx is None:
                 return None
 
-    count = getattr(rr, "_count", None)
-    if count is not None and idx >= count:
+    if not _within_limits(rr, idx, _to_utc(target)):
         return None
-    until = rule.get("until")
-    if until is not None:
-        until_utc = until if until.tzinfo else until.replace(
-            tzinfo=ZoneInfo("UTC"))
-        if occ_utc > _to_utc(until_utc):
-            return None
     return idx
 
 
@@ -205,7 +198,121 @@ def _weekly_byday_index(start, target, interval, weekdays) -> int | None:
 
 
 def occurrence_at(rr: _rr.rrule, index: int) -> _dt.datetime:
-    return _to_utc(rr[index])
+    """UTC instant of the ``index``-th (0-based) occurrence.
+
+    Arithmetic for DAILY/WEEKLY (O(1), even for indices far past DTSTART);
+    dateutil's ``rr[index]`` would generate and cache every earlier member.
+    Results match ``rr[index]`` (property-tested in tests/test_rrule_index.py).
+    """
+    if index < 0:
+        raise IndexError("occurrence index must be >= 0")
+    tz = rr._dtstart.tzinfo
+    local = nth_local(rr, index)
+    if tz is None:
+        return local.replace(tzinfo=ZoneInfo("UTC"))
+    return _to_utc(local.replace(tzinfo=tz))
+
+
+def nth_local(rr: _rr.rrule, n: int) -> _dt.datetime:
+    """Naive local wall time of the n-th occurrence (fold=0 at DST repeats)."""
+    start: _dt.datetime = rr._dtstart
+    wall = start.timetz().replace(tzinfo=None)
+    interval = rr._interval or 1
+    if rr._freq == _rr.DAILY:
+        return _dt.datetime.combine(
+            start.date() + _dt.timedelta(days=interval * n), wall)
+
+    rule = getattr(rr, "_original_rule", {}) or {}
+    byday = rule.get("byweekday")
+    if byday is None:
+        return _dt.datetime.combine(
+            start.date() + _dt.timedelta(weeks=interval * n), wall)
+
+    weekdays = sorted(d.weekday for d in byday)
+    first_week = [w for w in weekdays if w >= start.weekday()]
+    first_count = len(first_week)
+    monday0 = start.date() - _dt.timedelta(days=start.weekday())
+    if n < first_count:
+        day = monday0 + _dt.timedelta(days=first_week[n])
+        return _dt.datetime.combine(day, wall)
+    rem = n - first_count
+    block = 1 + rem // len(weekdays)
+    pos = rem % len(weekdays)
+    day = monday0 + _dt.timedelta(
+        weeks=interval * block, days=weekdays[pos])
+    return _dt.datetime.combine(day, wall)
+
+
+def _within_limits(rr: _rr.rrule, index: int,
+                   when_utc: _dt.datetime) -> bool:
+    """Membership test for COUNT/UNTIL caps on an arithmetically built member."""
+    count = getattr(rr, "_count", None)
+    if count is not None and index >= count:
+        return False
+    # dateutil keeps UNTIL on the rrule object (not in ``_original_rule``).
+    until = getattr(rr, "_until", None)
+    if until is not None:
+        until_utc = until if until.tzinfo else until.replace(
+            tzinfo=ZoneInfo("UTC"))
+        if when_utc > _to_utc(until_utc):
+            return False
+    return True
+
+
+def first_index_at_or_after(rr: _rr.rrule,
+                            target_utc: _dt.datetime) -> int | None:
+    """Smallest occurrence index whose UTC start is >= ``target_utc``.
+
+    O(log n) over arithmetic members; None when no COUNT/UNTIL member reaches
+    the target.  Infinite DAILY/WEEKLY rules always yield an answer.
+    """
+    count = getattr(rr, "_count", None)
+    if count is not None and count <= 0:
+        return None
+
+    # Exponential search for an upper bound at/after the target, stopping the
+    # moment the next index leaves the COUNT/UNTIL domain.
+    lo, hi = 0, 0
+    while True:
+        when = occurrence_at(rr, hi)
+        if when >= target_utc:
+            break
+        nxt = hi + 1
+        if not _within_limits(rr, nxt, occurrence_at(rr, nxt)):
+            return None  # hi is the last member and still precedes target
+        lo, hi = nxt, max(hi + 1, hi * 2)
+        if count is not None:
+            hi = min(hi, count - 1)
+            if occurrence_at(rr, hi) < target_utc:
+                return None
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if occurrence_at(rr, mid) >= target_utc:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def occurrence_schedule(rr: _rr.rrule, win_start: _dt.datetime,
+                        win_end: _dt.datetime):
+    """Yield (index, utc_datetime) for occurrences starting in the window.
+
+    Pure arithmetic (no expansion before ``win_start``); iteration stops as
+    soon as the window end or a COUNT/UNTIL cap is passed.
+    """
+    idx = first_index_at_or_after(rr, win_start)
+    if idx is None:
+        return
+    while True:
+        when = occurrence_at(rr, idx)
+        if not _within_limits(rr, idx, when):
+            return
+        if when >= win_end:
+            return
+        yield idx, when
+        idx += 1
 
 
 def last_occurrence(rr: _rr.rrule, count: int | None) -> _dt.datetime | None:

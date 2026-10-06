@@ -72,11 +72,15 @@ python3 -m pytest -q
 
 - 支持 IANA `TZID`（含夏令时）、`FREQ=DAILY` / `FREQ=WEEKLY`、`INTERVAL`、`BYDAY`、`WKST`、`UNTIL`、`COUNT`、`EXDATE`。
 - 单次例外（带 `RECURRENCE-ID` 的 REQUEST）只改那一场；会议被移动时**保留原场次的 RECURRENCE-ID 身份**，只改变展示起止。
+  改距**没有上限**：原槽位即使在查询周之前或之后数年（远超旧的前后 400 天填充窗），只要改期后的展示时间落在查询半开窗内就会返回；
+  是否入议程由**显示时间**决定，身份仍是原 `RECURRENCE-ID`；原槽位与显示时间同时命中窗口时该身份**只裁决一次**。
+  显示时间移出窗口后，原槽位所在周不再显示该场。
 - 单次例外**优先于** `EXDATE`（可以在被挖空的槽位上重新创建一场）。
 - `RECURRENCE-ID` 不是规则成员时：命中已移动场次的新起点即按原场次绑定；否则**回拨到较早的一次有效场次**，回拨会跳过 `EXDATE` 空洞。
 - `RANGE=THISANDFUTURE`（REQUEST）：保留边界之前的场次，边界起按例外的新起点与相同节奏延续，尾部场次仍用各自原始 RECURRENCE-ID。
+  边界本身可以距查询窗任意远——尾部是否入窗由算术定位，不依赖任何固定填充范围。
 - `RANGE=THISANDFUTURE`（CANCEL）：取消边界及之后所有场次；边界之后若来一份更新的单场 REQUEST，可单独复活该场。
-- 无限 `RRULE`（无 `COUNT/UNTIL`）**从不预展开**：查询只在窗口内有界枚举，场次下标用算术计算。
+- 无限 `RRULE`（无 `COUNT/UNTIL`）**从不预展开**：查询用算术二分定位窗口内的首场，再在窗口内有界枚举，场次下标用算术计算。
 - 乱序投递：先到的 `REPLY` / `CANCEL`（甚至单场 REQUEST 例外）若还没有对应的 REQUEST，会进入暂存区；等 REQUEST 补齐后在同一事务里补裁决。
 
 **错误**
@@ -283,7 +287,122 @@ curl -s -G http://localhost:8000/agenda \
 同一窗口查 `bob@example.com`：他没有回复，所有未取消场次都是 `needs-action`，
 且 3/10 不会因为 alice 接受而改变。
 
-### 7) 乱序投递：先 REPLY，后 REQUEST
+### 7) 跨年单次改期：前移、后移多远都只出现一次
+
+旧实现只对查询周前后各 **400 天**的原槽位展开规则，再远的原场次即使被改期到查询周内也会漏掉。
+下面用一条自 2020 年起的**无限**周一例会演示：把 **2024-01-01** 那场前移到 2026 年、
+把 **2027-06-07** 那场后移到 2026 年，原槽位都离查询周超过 400 天。
+
+先建主会议（与上面同一套 curl 用法，省略重复的包装说明）：
+
+```text
+POST /messages
+BEGIN:VCALENDAR
+VERSION:2.0
+METHOD:REQUEST
+BEGIN:VEVENT
+UID:cross-year-planning@acme.example
+DTSTAMP:20200101T000000Z
+SEQUENCE:0
+DTSTART:20200106T090000Z
+DTEND:20200106T100000Z
+RRULE:FREQ=WEEKLY;BYDAY=MO;WKST=MO
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:alice@example.com
+ATTENDEE;PARTSTAT=NEEDS-ACTION:mailto:bob@example.com
+ORGANIZER:mailto:boss@acme.example
+SUMMARY:Cross-year planning
+END:VEVENT
+END:VCALENDAR
+
+→ {"method":"REQUEST","results":[{"uid":"cross-year-planning@acme.example","kind":"REQUEST","result":"stored"}]}
+```
+
+把 2024-01-01（周一 09:00 原槽位）**前移**到 2026-01-07 周三 10:00（UTC）：
+
+```text
+METHOD:REQUEST
+UID:cross-year-planning@acme.example
+DTSTAMP:20231220T000000Z
+RECURRENCE-ID:20240101T090000Z
+DTSTART:20260107T100000Z
+DTEND:20260107T110000Z
+
+→ {"method":"REQUEST","results":[{"uid":"cross-year-planning@acme.example","kind":"REQUEST","result":"stored"}]}
+```
+
+把 2027-06-07（周一 09:00 原槽位）**后移**到 2026-01-08 周四 16:00（UTC）：
+
+```text
+METHOD:REQUEST
+UID:cross-year-planning@acme.example
+DTSTAMP:20270601T000000Z
+RECURRENCE-ID:20270607T090000Z
+DTSTART:20260108T160000Z
+DTEND:20260108T170000Z
+
+→ {"method":"REQUEST","results":[{"uid":"cross-year-planning@acme.example","kind":"REQUEST","result":"stored"}]}
+```
+
+alice 只接受被前移的那一场（REPLY 仍以**原** RECURRENCE-ID 为身份）：
+
+```text
+METHOD:REPLY
+UID:cross-year-planning@acme.example
+DTSTAMP:20231221T000000Z
+RECURRENCE-ID:20240101T090000Z
+ATTENDEE;PARTSTAT=ACCEPTED:mailto:alice@example.com
+
+→ {"method":"REPLY","results":[{"uid":"cross-year-planning@acme.example","kind":"REPLY","result":"stored"}]}
+```
+
+查 2026 年第 2 周（`week=2026-W02` 即 UTC `[2026-01-05 00:00, 2026-01-12 00:00)`）：
+
+```bash
+curl -s -G http://localhost:8000/agenda \
+  --data-urlencode attendee=alice@example.com \
+  --data-urlencode week=2026-W02
+```
+
+返回三场：当周未改动的周一例会，加上从 2024 年前移、从 2027 年后移进来的两场。
+后两者保留各自**原始 RECURRENCE-ID 身份**，显示用改期起止；每个身份只出现一次，
+EXDATE / 单场回复 / 单场取消 / RANGE 裁决照常生效（alice 接受的是前移那场）：
+
+```json
+{
+  "attendee": "alice@example.com",
+  "start": "2026-01-05T00:00:00+00:00",
+  "end": "2026-01-12T00:00:00+00:00",
+  "events": [
+    {
+      "uid": "cross-year-planning@acme.example",
+      "recurrence_id": "2026-01-05T09:00:00+00:00",
+      "start": "2026-01-05T09:00:00+00:00",
+      "end": "2026-01-05T10:00:00+00:00",
+      "status": "needs-action"
+    },
+    {
+      "uid": "cross-year-planning@acme.example",
+      "recurrence_id": "2024-01-01T09:00:00+00:00",
+      "start": "2026-01-07T10:00:00+00:00",
+      "end": "2026-01-07T11:00:00+00:00",
+      "status": "accepted"
+    },
+    {
+      "uid": "cross-year-planning@acme.example",
+      "recurrence_id": "2027-06-07T09:00:00+00:00",
+      "start": "2026-01-08T16:00:00+00:00",
+      "end": "2026-01-08T17:00:00+00:00",
+      "status": "needs-action"
+    }
+  ]
+}
+```
+
+查 `bob@example.com` 同样得到这三场（展示时间相同），但他没有回复，三场均为 `needs-action`。
+反过来查 **2024-W01**（前移场次的原槽位那一周）结果为空——2024-01-01 那场的显示时间已经前移到 2026 年，
+原槽位不再生成它（该周也没有别的周一例会落进来）。
+
+### 8) 乱序投递：先 REPLY，后 REQUEST
 
 REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；随后 REQUEST 补齐，
 暂存的回复在同一事务里补裁决，议程直接显示 `declined`：
@@ -312,7 +431,7 @@ REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；�
 }
 ```
 
-### 8) 同版异文冲突 → 409
+### 9) 同版异文冲突 → 409
 
 同一个 `UID + SEQUENCE=0 + DTSTAMP`，但时间不同（两份"同一版本"内容不一致）：
 
@@ -328,7 +447,7 @@ REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；�
 
 若 SEQUENCE 相同但 **DTSTAMP 更晚**，则按时间裁决为内容刷新（`200 stored`），不报冲突。
 
-### 9) 未知时区 → 422
+### 10) 未知时区 → 422
 
 把上面的 `TZID=America/New_York` 改成 `TZID=Mars/Olympus`：
 
@@ -362,8 +481,10 @@ REPLY 先到时会议还不存在，进入暂存区（仍返回 `staged`）；�
 ## 五、性能
 
 - 单次/周期主表使用部分索引（单次按时间、周期按首场、例外按移动后起点）。
-- 周期查询默认只在请求窗口内有界枚举；只有存在移动例外的序列才向前后各扩 400 天
-  的填充窗以定位移动场次。
-- 场次下标为算术计算（O(1)），不从头枚举。
+- 周期查询**只在请求窗口内做算术枚举**（二分定位窗口首场，O(log n)），不再向前后扩固定填充窗；
+  显示时间命中窗口的单次例外走索引直查，因此无论原槽位多远都能命中，且每个 RECURRENCE-ID 只裁决一次。
+- 场次下标为算术计算（O(1)），不从头枚举（dateutil 的 `rr[100000]` 会线性生成前十万场，算术正解避开此成本）。
 - 基准测试 `tests/test_perf.py`：单个参会人 **100,000** 条历史通知（外加一条无限周规则），
   周窗查询约 **15–35 ms**（远低于 1 秒预算）；周窗约 100 场时同样在数十毫秒内。
+  另有 200 个带多年期 RANGE 边界与远距单次例外的序列叠加在 10 万历史之上时（周窗 200 场），
+  周窗查询约 **150–220 ms**。
